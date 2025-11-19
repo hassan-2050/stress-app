@@ -1,16 +1,20 @@
 import streamlit as st
-import pyaudio
-import wave
-import speech_recognition as sr
-from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
-from gtts import gTTS
-import os
-import time
-import numpy as np
-from PIL import Image
 import io
+import os
+import random
+import json
+from gtts import gTTS
+from PIL import Image  # kept for future use if needed
+from pydub import AudioSegment
 
-# Page configuration
+try:
+    import imageio_ffmpeg
+    AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    # If this fails, pydub will try system ffmpeg instead
+    pass
+
+# ---------- Page configuration ----------
 st.set_page_config(
     page_title="Stress Relief Assistant",
     page_icon="🧠",
@@ -18,7 +22,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for beautiful styling
+# ---------- Custom CSS ----------
 st.markdown("""
 <style>
     .main-header {
@@ -137,9 +141,7 @@ st.markdown("""
         color: white;
         box-shadow: 0 8px 25px rgba(76, 175, 80, 0.3);
     }
-    .main-content {
-        min-height: 600px;
-    }
+    .main-content { min-height: 600px; }
     .api-warning {
         background: linear-gradient(135deg, #ff6b6b, #ee5a52);
         padding: 1rem;
@@ -151,449 +153,446 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Audio recording parameters
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-RATE = 44100
-CHUNK = 1024
+# ---------- Config ----------
 WAVE_OUTPUT_FILENAME = "recorded_audio.wav"
-
-# Google Form URL (Replace with your actual Google Form link)
 FEEDBACK_FORM_URL = "https://docs.google.com/forms/d/your-form-id-here/viewform?usp=sharing"
 
+# ---------- Assistant ----------
 class StressAssistant:
     def __init__(self):
-        self.recognizer = sr.Recognizer()
-        self.model_name = "distilbert-base-uncased-finetuned-sst-2-english"
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
-        self.sentiment_analysis = pipeline("sentiment-analysis", 
-                                         model=self.model, tokenizer=self.tokenizer)
-        
-        # Set up Groq client - using environment variable or Streamlit secrets
         self.client = None
-        self._setup_groq_client()
-    
-    def _setup_groq_client(self):
-        """Initialize Groq client using environment variable or Streamlit secrets"""
+        self._setup_client()
+
+    def _setup_client(self):
+        """Initialize AI client using a hardcoded key (for local testing)."""
         try:
-            # Try Streamlit secrets first, then environment variable
-            api_key = None
-            if hasattr(st, 'secrets') and st.secrets and 'GROQ_API_KEY' in st.secrets:
-                api_key = st.secrets['GROQ_API_KEY']
-            else:
-                api_key = os.getenv('GROQ_API_KEY')
-            
-            if not api_key:
-                # Don't show error on GitHub - just disable AI features gracefully
-                st.sidebar.warning("🤖 AI Assistant: Setup Required")
-                st.sidebar.info("Set `GROQ_API_KEY` environment variable for AI recommendations")
-                return False
-            
             from groq import Client
+
+            # 🔴 WARNING: hardcoding secrets is unsafe for shared / production code.
+            # Use this ONLY for local experiments and NEVER commit this key.
+            api_key = "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"  # <-- put your key here locally
+
             self.client = Client(api_key=api_key)
+            # No provider name in UI message
             st.sidebar.success("🤖 AI Assistant: Connected ✓")
             return True
-            
-        except Exception as e:
-            st.sidebar.error(f"🤖 AI Setup Error: {str(e)[:50]}...")
+
+        except Exception:
+            # Generic message, no provider/API name exposed
+            st.sidebar.error("Assistant could not be initialized.")
             return False
-    
-    def record_audio(self, duration):
-        """Record audio with progress indication"""
+
+    def analyze_sentiment(self, text: str):
+        """
+        Classify sentiment via API.
+        Returns (label, score) where label ∈ {POSITIVE, NEGATIVE, NEUTRAL}.
+        """
+        if not self.client:
+            # Generic error, no API name
+            st.error("Sentiment analysis is not available at the moment.")
+            return "NEUTRAL", 0.5
+
         try:
-            audio = pyaudio.PyAudio()
-            stream = audio.open(format=FORMAT, channels=CHANNELS,
-                              rate=RATE, input=True,
-                              frames_per_buffer=CHUNK)
-            
-            # Recording progress bar
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            frames = []
-            
-            status_text.markdown('<div class="recording-indicator">🎤 Recording... Speak naturally!</div>', 
-                               unsafe_allow_html=True)
-            
-            for i in range(0, int(RATE / CHUNK * duration)):
-                data = stream.read(CHUNK, exception_on_overflow=False)
-                frames.append(data)
-                
-                # Update progress
-                progress = (i + 1) / (int(RATE / CHUNK * duration))
-                progress_bar.progress(progress)
-                time.sleep(0.01)
-            
-            stream.stop_stream()
-            stream.close()
-            audio.terminate()
-            
-            # Save audio file
-            wf = wave.open(WAVE_OUTPUT_FILENAME, 'wb')
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(audio.get_sample_size(FORMAT))
-            wf.setframerate(RATE)
-            wf.writeframes(b''.join(frames))
-            wf.close()
-            
-            status_text.success("✅ Recording completed!")
-            return True
-            
+            system_prompt = """
+You are a precise sentiment classifier.
+Given the user's text, respond ONLY with a JSON object like:
+{"label": "POSITIVE" | "NEGATIVE" | "NEUTRAL", "score": float between 0 and 1}
+
+Rules:
+- label must be one of: POSITIVE, NEGATIVE, NEUTRAL
+- score is your confidence.
+Do NOT add any extra text.
+""".strip()
+
+            resp = self.client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0.0,
+                max_tokens=60,
+            )
+
+            content = resp.choices[0].message.content.strip()
+            data = json.loads(content)
+
+            label = str(data.get("label", "NEUTRAL")).upper()
+            score = float(data.get("score", 0.5))
+
+            if label not in ["POSITIVE", "NEGATIVE", "NEUTRAL"]:
+                label = "NEUTRAL"
+
+            score = max(0.0, min(1.0, score))
+            return label, score
+
         except Exception as e:
-            st.error(f"Recording failed: {e}")
-            return False
-    
-    def transcribe_audio(self):
-        """Transcribe audio to text"""
-        try:
-            with sr.AudioFile(WAVE_OUTPUT_FILENAME) as source:
-                # Adjust for ambient noise
-                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                audio_data = self.recognizer.record(source)
-                text = self.recognizer.recognize_google(audio_data)
-                return text
-        except sr.UnknownValueError:
-            st.warning("Could not understand audio. Please try speaking more clearly.")
-            return None
-        except sr.RequestError as e:
-            st.error(f"Speech recognition error: {e}")
-            return None
-    
-    def analyze_sentiment(self, text):
-        """Analyze sentiment of the transcribed text"""
-        try:
-            result = self.sentiment_analysis(text)[0]
-            sentiment = result['label']
-            confidence = result['score']
-            return sentiment, confidence
-        except Exception as e:
+            # Generic failure text
             st.error(f"Sentiment analysis failed: {e}")
             return "NEUTRAL", 0.5
-    
-    def get_recommendation(self, text, sentiment):
-        """Get personalized recommendation from LLM or fallback suggestion"""
+
+    def transcribe_audio_groq_first(self, wav_path: str):
+        """
+        Use cloud transcription for robust, accurate transcription.
+        """
         if not self.client:
-            # Graceful fallback when AI is not available
+            st.error("Transcription service is not available at the moment.")
+            return None
+
+        try:
+            with open(wav_path, "rb") as f:
+                data = f.read()
+
+            resp = self.client.audio.transcriptions.create(
+                model="whisper-large-v3-turbo",
+                file=(os.path.basename(wav_path), data),
+            )
+
+            if hasattr(resp, "text") and resp.text:
+                return resp.text
+            if isinstance(resp, dict) and "text" in resp:
+                return resp["text"]
+            return None
+
+        except Exception as e:
+            st.error(f"Transcription failed: {e}")
+            return None
+
+    def get_recommendation(self, text: str, sentiment: str):
+        """Get personalized recommendation from LLM (API-based)."""
+        if not self.client:
             fallback_suggestions = [
-                """🌿 **Quick Stress Relief**: It sounds like you're carrying a lot right now. Try this simple breathing exercise: **Inhale for 4 seconds, hold for 4, exhale for 6.** Repeat 3 times. You're doing great just by taking this moment for yourself! 💚""",
-                """🌈 **Gentle Reminder**: It's completely normal to feel overwhelmed sometimes. Try writing down 3 things you're grateful for, no matter how small. This simple practice can shift your perspective. You're stronger than you think! 🌟""",
-                """💧 **Self-Care Moment**: Take a slow sip of water and stretch your arms above your head. Sometimes our body just needs a small reminder that we're here and safe. You've got this! 🫂""",
-                """☀️ **Nature Break**: Step outside for 2 minutes if you can, or just look out a window. Notice one thing you can see, hear, or feel. Connecting with your senses can ground you. You're doing important work! 🌱"""
+                ("🌿 **Quick Stress Relief**: It sounds like you're carrying a lot right now. "
+                 "Try this breathing: **Inhale 4, hold 4, exhale 6** ×3. You took a great step by pausing 💚"),
+                ("🌈 **Gentle Reminder**: Feeling overwhelmed is human. "
+                 "Jot down 3 tiny things you're grateful for—this often shifts perspective 🌟"),
+                ("💧 **Self-Care Moment**: Take a slow sip of water and stretch your arms overhead. "
+                 "Your body sometimes needs a reminder that you're safe 🫂"),
+                ("☀️ **Nature Break**: Look out a window for 2 minutes. "
+                 "Notice one thing you can see, hear, and feel—it grounds the nervous system 🌱"),
             ]
-            import random
             return random.choice(fallback_suggestions)
-        
+
         try:
             system_prompt = f"""
-            You are a compassionate psychologist specializing in stress management. 
-            Based on the user's spoken text and their detected sentiment ({sentiment}), 
-            provide a warm, empathetic, and practical recommendation in 1-2 sentences.
-            
-            Focus on:
-            - Acknowledging their feelings
-            - Offering a simple, actionable suggestion
-            - Providing gentle encouragement
-            
-            Keep it concise, supportive, and professional.
-            """
-            
+You are a compassionate psychologist specializing in stress management.
+Based on the user's spoken text and their detected sentiment ({sentiment}),
+provide a warm, empathetic, and practical recommendation in 1–2 sentences.
+
+Focus on:
+- Acknowledging their feelings
+- Offering a simple, actionable suggestion
+- Providing gentle encouragement
+
+Keep it concise, supportive, and professional.
+""".strip()
+
             llm_response = self.client.chat.completions.create(
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"User said: '{text}'"}
+                    {"role": "user", "content": f"User said: '{text}'"},
                 ],
                 model="llama-3.1-8b-instant",
                 temperature=0.7,
-                max_tokens=100
+                max_tokens=120,
             )
-            
             return llm_response.choices[0].message.content.strip()
-            
+
         except Exception as e:
             st.error(f"Failed to generate AI recommendation: {e}")
-            # Fallback to random suggestion
             fallback_suggestions = [
-                "Take a deep breath and remember that it's okay to feel this way. Try going for a short walk to clear your mind.",
-                "You're doing great just by acknowledging how you feel. Try placing a hand on your heart and taking 3 slow breaths.",
-                "It's normal to have tough moments. Give yourself permission to pause and do one small thing that brings you comfort."
+                "Take a slow breath and allow the feeling to be there. A 5-minute walk can reset your mind.",
+                "You’re doing well by noticing how you feel. Place a hand on your chest and take 3 calm breaths.",
+                "Tough moments pass. Choose one small, kind action for yourself right now.",
             ]
-            import random
             return random.choice(fallback_suggestions)
 
+# ---------- App ----------
 def main():
-    # Initialize the assistant
     assistant = StressAssistant()
-    
+
     # Header
     st.markdown('<h1 class="main-header">🧠 Stress Relief Assistant</h1>', unsafe_allow_html=True)
-    st.markdown('<p class="subtitle">Your personal mental wellness companion - speak your mind, receive gentle guidance</p>', 
-                unsafe_allow_html=True)
-    
-    # Session state for tracking
-    if 'session_completed' not in st.session_state:
+    st.markdown(
+        '<p class="subtitle">Your personal mental wellness companion - speak your mind, receive gentle guidance</p>',
+        unsafe_allow_html=True,
+    )
+
+    # Session state
+    if "session_completed" not in st.session_state:
         st.session_state.session_completed = False
-    if 'transcribed_text' not in st.session_state:
+    if "transcribed_text" not in st.session_state:
         st.session_state.transcribed_text = None
-    if 'recommendation' not in st.session_state:
+    if "recommendation" not in st.session_state:
         st.session_state.recommendation = None
-    if 'sentiment' not in st.session_state:
+    if "sentiment" not in st.session_state:
         st.session_state.sentiment = None
-    if 'confidence' not in st.session_state:
+    if "confidence" not in st.session_state:
         st.session_state.confidence = None
-    
-    # Sidebar with instructions
+
+    # Sidebar
     with st.sidebar:
         st.header("📋 How to Use")
         st.markdown("""
-        ### 🎙️ **Recording Instructions:**
-        1. **Click "Start Recording"** below
-        2. **Speak naturally** about how you're feeling (work stress, personal challenges, etc.)
-        3. **Wait for the recording to complete** (progress bar will show)
-        4. **Review your analysis** and personalized recommendation
-        5. **Provide feedback** at the end to help us improve!
-        
-        ### 💡 **Tips for Best Results:**
-        - Speak clearly in a quiet environment
-        - Try to express your current emotions honestly
-        - Recording length: 5-30 seconds works best
-        - The system analyzes your tone and provides gentle guidance
-        
-        ### 🎯 **What You'll Get:**
-        - 📊 Sentiment analysis of your speech
-        - 🎧 Audio playback of your recording
-        - 💬 Personalized stress relief recommendation
-        - 🔊 Spoken recommendation in calming voice
-        - 📝 Quick feedback opportunity
-        
-        ### 🔧 **Setup for AI Features:**
-        Set `GROQ_API_KEY` environment variable for personalized AI recommendations
+### 🎙️ Recording Instructions
+1. Click the recorder below and speak (up to ~60s).
+2. Wait for it to finish and upload.
+3. Your audio is processed and analyzed automatically.
+4. Review your analysis and guidance.
+
+### 💡 Tips
+- Quiet environment helps.
+- Speak naturally about how you feel.
+
+### 🎯 You Get
+- 📊 Sentiment analysis
+- 🎧 Audio playback
+- 💬 Personalized recommendation
+- 🔊 Spoken recommendation (gTTS)
+- 📝 Quick feedback
         """)
-        
         st.markdown("---")
-        st.markdown("### ℹ️ **Privacy Notice**")
+        st.markdown("### ℹ️ Privacy Notice")
         st.info("""
-        🔒 **Your Privacy Matters:**
-        - Audio processed locally, not stored
-        - Transcriptions used only for analysis
-        - No personal data collected
-        - All processing happens in-browser
-        - Feedback is anonymous
+🔒 Your Privacy Matters:
+- Audio handled inside your app session
+- Transcriptions used only for analysis & guidance
+- No personal data is stored by this app
         """)
-    
-    # Main content - Use tabs for better organization
+
     tab1, tab2 = st.tabs(["🎙️ Record Session", "📊 Your Results"])
-    
+
+    # ------------ TAB 1: Record ------------
     with tab1:
-        # Recording controls
         st.subheader("🎙️ Record Your Thoughts")
-        
-        # Duration slider
-        duration = st.slider(
-            "Recording Duration", 
-            min_value=3, 
-            max_value=60, 
-            value=10,
-            help="Choose how long you'd like to speak (3-60 seconds)"
+        audio_file = st.audio_input("Click to record (browser mic)")
+
+        st.caption(
+            "Tip: Speak clearly for ~10–30 seconds for best results. "
+            "We’ll convert your recording to a clean 16 kHz mono WAV."
         )
-        
-        # Record button
-        if st.button("🎤 Start Recording", key="record", use_container_width=True):
-            if assistant.record_audio(duration):
-                with st.spinner("🔍 Processing your voice..."):
-                    # Transcribe
-                    transcribed_text = assistant.transcribe_audio()
-                    
-                    if transcribed_text:
-                        # Store in session state
-                        st.session_state.transcribed_text = transcribed_text
-                        st.session_state.session_completed = True
-                        
-                        # Analyze sentiment
-                        sentiment, confidence = assistant.analyze_sentiment(transcribed_text)
-                        st.session_state.sentiment = sentiment
-                        st.session_state.confidence = confidence
-                        
-                        # Get recommendation
-                        with st.spinner("🤔 Generating personalized recommendation..."):
-                            recommendation = assistant.get_recommendation(transcribed_text, sentiment)
-                            st.session_state.recommendation = recommendation
-                        
-                        # Play original audio
-                        st.audio(WAVE_OUTPUT_FILENAME, format='audio/wav')
-                        
-                        st.success("✅ Session completed! Check your results in the 'Your Results' tab.")
-    
+
+        if audio_file is not None:
+            try:
+                # 1) Read raw bytes
+                raw_bytes = audio_file.read()
+                if not raw_bytes:
+                    st.error("No audio data received from the browser.")
+                    st.stop()
+
+                # 2) Decode with pydub
+                try:
+                    audio_seg = AudioSegment.from_file(io.BytesIO(raw_bytes))
+                except Exception as e:
+                    st.error("❌ Could not read the audio data. "
+                             "Make sure ffmpeg is installed and the format is supported.")
+                    st.exception(e)
+                    st.stop()
+
+                # 3) Standardize to 16k mono WAV
+                try:
+                    audio_seg = audio_seg.set_channels(1).set_frame_rate(16000).set_sample_width(2)
+                    audio_seg.export(WAVE_OUTPUT_FILENAME, format="wav")
+                except Exception as e:
+                    st.error("❌ Failed to convert audio to WAV. "
+                             "This is usually an ffmpeg issue (missing or not found).")
+                    st.exception(e)
+                    st.stop()
+
+                # 4) Playback
+                st.audio(WAVE_OUTPUT_FILENAME, format="audio/wav")
+
+                # 5) Transcription
+                with st.spinner("🔍 Transcribing your voice..."):
+                    transcribed_text = assistant.transcribe_audio_groq_first(WAVE_OUTPUT_FILENAME)
+
+                if not transcribed_text:
+                    st.warning("I couldn't understand the audio well enough. "
+                               "Try speaking a bit closer to the mic.")
+                    st.stop()
+
+                st.session_state.transcribed_text = transcribed_text
+                st.session_state.session_completed = True
+
+                # 6) Sentiment
+                with st.spinner("🎭 Analyzing your emotional tone..."):
+                    sentiment, confidence = assistant.analyze_sentiment(transcribed_text)
+                st.session_state.sentiment = sentiment
+                st.session_state.confidence = confidence
+
+                # 7) Recommendation
+                with st.spinner("🤔 Generating personalized recommendation..."):
+                    recommendation = assistant.get_recommendation(transcribed_text, sentiment)
+                st.session_state.recommendation = recommendation
+
+                st.success("✅ Session completed! Check your results in the 'Your Results' tab.")
+
+            except Exception as e:
+                st.error("Unexpected error while processing your recording.")
+                st.exception(e)
+
+    # ------------ TAB 2: Results ------------
     with tab2:
         st.markdown('<div class="main-content">', unsafe_allow_html=True)
-        
-        # Display results only if session completed
+
         if st.session_state.session_completed and st.session_state.transcribed_text:
-            
-            # Transcribed Text - Always visible and prominent
-            st.markdown("""
-            <div class="info-box">
-                <h3>📝 What You Shared</h3>
-                <p style="font-size: 1.2rem; margin: 1rem 0; font-style: italic; line-height: 1.5;">
-                """ + st.session_state.transcribed_text + """
-                </p>
-                <div style="text-align: right; font-size: 0.9rem; color: #5D6D7E;">
-                    💭 Your honest words help us understand you better
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # Sentiment Analysis - Always visible
+            # What you shared
+            st.markdown(f"""
+<div class="info-box">
+    <h3>📝 What You Shared</h3>
+    <p style="font-size: 1.2rem; margin: 1rem 0; font-style: italic; line-height: 1.5;">
+        {st.session_state.transcribed_text}
+    </p>
+    <div style="text-align: right; font-size: 0.9rem; color: #5D6D7E;">
+        💭 Your honest words help us understand you better
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+            # Sentiment
             if st.session_state.sentiment:
-                sentiment_emoji = "😊" if st.session_state.sentiment == "POSITIVE" else "😔" if st.session_state.sentiment == "NEGATIVE" else "😐"
-                sentiment_color_class = "sentiment-positive" if st.session_state.sentiment == "POSITIVE" else "sentiment-negative"
-                
-                confidence = st.session_state.confidence if st.session_state.confidence else 0.5
-                
+                sentiment = st.session_state.sentiment
+                conf = st.session_state.confidence or 0.5
+                sentiment_emoji = "😊" if sentiment == "POSITIVE" else "😔" if sentiment == "NEGATIVE" else "😐"
+                sentiment_color_class = (
+                    "sentiment-positive" if sentiment == "POSITIVE" else "sentiment-negative"
+                )
+
                 st.markdown(f"""
-                <div class="{sentiment_color_class}">
-                    <h3>{sentiment_emoji} Your Emotional State</h3>
-                    <p style="font-size: 1.1rem; margin: 0.5rem 0;">Detected: <strong>{st.session_state.sentiment}</strong></p>
-                    <p style="margin: 0.5rem 0; opacity: 0.9;">Confidence: <strong>{(confidence * 100):.1f}%</strong></p>
-                    <div style="margin-top: 1rem; font-size: 0.9rem; opacity: 0.8;">
-                        🌈 This helps us tailor the perfect recommendation for you
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            # Recommendation - Always visible and prominent
+<div class="{sentiment_color_class}">
+    <h3>{sentiment_emoji} Your Emotional State</h3>
+    <p style="font-size: 1.1rem; margin: 0.5rem 0;">Detected: <strong>{sentiment}</strong></p>
+    <p style="margin: 0.5rem 0; opacity: 0.9;">Confidence: <strong>{(conf * 100):.1f}%</strong></p>
+    <div style="margin-top: 1rem; font-size: 0.9rem; opacity: 0.8;">
+        🌈 This helps us tailor the perfect recommendation for you
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+            # Recommendation
             if st.session_state.recommendation:
-                st.markdown("""
-                <div class="result-box">
-                    <h3>💡 Your Personalized Guidance</h3>
-                    <div style="font-size: 1.3rem; font-style: italic; margin: 1.5rem 0; line-height: 1.6; background: rgba(255,255,255,0.1); padding: 1.5rem; border-radius: 10px;">
-                    """ + st.session_state.recommendation + """
-                    </div>
-                    <div style="text-align: center; margin-top: 1rem; font-size: 0.9rem; color: #2E86AB;">
-                        🌟 Remember, small steps lead to big changes
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                # Audio Recommendation - Always visible
+                st.markdown(f"""
+<div class="result-box">
+    <h3>💡 Your Personalized Guidance</h3>
+    <div style="font-size: 1.3rem; font-style: italic; margin: 1.5rem 0; line-height: 1.6; background: rgba(255,255,255,0.1); padding: 1.5rem; border-radius: 10px;">
+        {st.session_state.recommendation}
+    </div>
+    <div style="text-align: center; margin-top: 1rem; font-size: 0.9rem; color: #2E86AB;">
+        🌟 Remember, small steps lead to big changes
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+                # TTS
                 try:
                     with st.spinner("🗣️ Creating audio recommendation..."):
-                        tts = gTTS(text=st.session_state.recommendation, lang='en', slow=False)
+                        tts = gTTS(text=st.session_state.recommendation, lang="en", slow=False)
                         recommendation_audio_path = "recommendation.mp3"
                         tts.save(recommendation_audio_path)
-                        
+
                     st.markdown("""
-                    <div style="background: linear-gradient(135deg, #667eea, #764ba2); padding: 1.5rem; border-radius: 15px; margin: 1rem 0; text-align: center;">
-                        <h4 style="color: white; margin: 0 0 1rem 0;">🎧 Listen to Your Recommendation</h4>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                    st.audio(recommendation_audio_path, format='audio/mp3')
-                    
-                    # Download button
+<div style="background: linear-gradient(135deg, #667eea, #764ba2); padding: 1.5rem; border-radius: 15px; margin: 1rem 0; text-align: center;">
+    <h4 style="color: white; margin: 0 0 1rem 0;">🎧 Listen to Your Recommendation</h4>
+</div>
+""", unsafe_allow_html=True)
+
+                    st.audio(recommendation_audio_path, format="audio/mp3")
+
                     with open(recommendation_audio_path, "rb") as audio_file:
                         st.download_button(
                             label="💾 Download This Guidance",
                             data=audio_file.read(),
                             file_name="my_stress_relief_guidance.mp3",
                             mime="audio/mpeg",
-                            use_container_width=True
+                            use_container_width=True,
                         )
-                        
                 except Exception as e:
                     st.error(f"Audio generation failed: {e}")
-            
-            # Quick Action Buttons
+
+            # Quick actions
             col1, col2, col3 = st.columns(3)
             with col1:
                 if st.button("🔄 New Session", use_container_width=True):
-                    # Reset session
-                    for key in ['session_completed', 'transcribed_text', 'recommendation', 'sentiment', 'confidence']:
-                        st.session_state[key] = None if key != 'session_completed' else False
+                    for key in ["session_completed", "transcribed_text", "recommendation", "sentiment", "confidence"]:
+                        st.session_state[key] = None if key != "session_completed" else False
                     st.rerun()
-            
+
             with col2:
                 st.markdown("---")
                 st.info("👆 Switch to 'Record Session' tab to start fresh")
-            
+
             with col3:
                 if st.button("📝 Save This Session", use_container_width=True):
                     st.success("Session saved to your browser! 🎉")
-        
+
         else:
             st.info("""
-            ### 🌟 Welcome to Your Wellness Journey
-            
-            **Start by recording your thoughts in the "Record Session" tab above.**
-            
-            **What to expect:**
-            - 📝 Your words will appear here clearly
-            - 🎭 We'll analyze your emotional tone
-            - 💡 You'll receive personalized guidance
-            - 🎧 Hear your recommendation in a calming voice
-            
-            **Remember:** This is a safe space to express yourself honestly.
-            """)
-        
-        st.markdown('</div>', unsafe_allow_html=True)
-    
-    # Feedback section - only show after session completion
+### 🌟 Welcome to Your Wellness Journey
+
+**Start by recording your thoughts in the "Record Session" tab above.**
+
+**What to expect:**
+- 📝 Your words will appear here clearly
+- 🎭 We'll analyze your emotional tone
+- 💡 You'll receive personalized guidance
+- 🎧 Hear your recommendation in a calming voice
+
+**Remember:** This is a safe space to express yourself honestly.
+""")
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ------------ Post-session Feedback ------------
     if st.session_state.session_completed and st.session_state.transcribed_text:
         st.markdown("---")
         st.markdown("""
-        <div class="session-complete">
-            <h2>🎉 Thank You for This Moment of Self-Care!</h2>
-            <p style="font-size: 1.2rem; margin: 1rem 0;">Your vulnerability is your strength 💪</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Feedback section
+<div class="session-complete">
+    <h2>🎉 Thank You for This Moment of Self-Care!</h2>
+    <p style="font-size: 1.2rem; margin: 1rem 0;">Your vulnerability is your strength 💪</p>
+</div>
+""", unsafe_allow_html=True)
+
         st.markdown("""
-        <div class="feedback-box">
-            <h3>📝 Help Us Support You Better</h3>
-            <p style="font-size: 1.1rem; margin: 1rem 0;">Your feedback helps us make this tool even more helpful for everyone!</p>
-            <p style="font-size: 1rem; margin: 0.5rem 0; opacity: 0.9;">It takes just 1 minute and is completely anonymous</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Feedback button
+<div class="feedback-box">
+    <h3>📝 Help Us Support You Better</h3>
+    <p style="font-size: 1.1rem; margin: 1rem 0;">Your feedback helps us make this tool even more helpful for everyone!</p>
+    <p style="font-size: 1rem; margin: 0.5rem 0; opacity: 0.9;">It takes just 1 minute and is completely anonymous</p>
+</div>
+""", unsafe_allow_html=True)
+
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
             st.markdown(f"""
-            <div style="margin-top: 1rem;">
-                <a href="{FEEDBACK_FORM_URL}" target="_blank" style="
-                    background: linear-gradient(45deg, #4CAF50, #45a049);
-                    color: white;
-                    padding: 12px 30px;
-                    text-decoration: none;
-                    border-radius: 25px;
-                    font-weight: bold;
-                    font-size: 1.1rem;
-                    display: inline-block;
-                    box-shadow: 0 4px 15px rgba(76, 175, 80, 0.4);
-                    transition: all 0.3s ease;
-                ">
-                    🌟 Share Your Feedback
-                </a>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        # Feedback preview
+<div style="margin-top: 1rem; text-align:center;">
+    <a href="{FEEDBACK_FORM_URL}" target="_blank" style="
+        background: linear-gradient(45deg, #4CAF50, #45a049);
+        color: white;
+        padding: 12px 30px;
+        text-decoration: none;
+        border-radius: 25px;
+        font-weight: bold;
+        font-size: 1.1rem;
+        display: inline-block;
+        box-shadow: 0 4px 15px rgba(76, 175, 80, 0.4);
+        transition: all 0.3s ease;">
+        🌟 Share Your Feedback
+    </a>
+</div>
+""", unsafe_allow_html=True)
+
         with st.expander("👀 Preview: What we'll ask you", expanded=False):
             st.markdown("""
-            ### Quick 4-question survey:
-            1. ⭐ **How helpful was the recommendation?** (1-5 stars)
-            2. 💭 **What felt most meaningful to you?**
-            3. 💡 **What could we improve?** (optional)
-            4. ⏱️ **How was the experience overall?**
-            
-            *All responses are anonymous and help us serve you better!*
-            """)
-        
+### Quick 4-question survey:
+1. ⭐ **How helpful was the recommendation?** (1-5 stars)
+2. 💭 **What felt most meaningful to you?**
+3. 💡 **What could we improve?** (optional)
+4. ⏱️ **How was the experience overall?**
+
+*All responses are anonymous and help us serve you better!*
+""")
+
         st.balloons()
         st.success("💚 You're doing important work by caring for your mental wellness!")
-    
-    # Footer
-    
 
 if __name__ == "__main__":
     main()
