@@ -1,6 +1,6 @@
-streamlit==1.38.0
-gTTS==2.5.3
-pydub==0.25.1
-Pillow==10.4.0
-imageio-ffmpeg==0.4.9
-groq==0.5.0
+streamlit
+numpy
+soundfile
+gTTS
+Pillow
+groq
