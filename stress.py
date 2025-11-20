@@ -3,7 +3,7 @@ import io
 import os
 import json
 from gtts import gTTS
-from PIL import Image  # not used yet, but kept for future UI work
+from PIL import Image  # reserved for future UI work
 
 # ---------------------- PAGE CONFIG ----------------------
 st.set_page_config(
@@ -110,7 +110,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ---------------------- CONSTANTS ----------------------
-WAVE_OUTPUT_FILENAME = "recorded_audio_input"
+# ✅ give it a valid audio extension so Groq can detect type
+WAVE_OUTPUT_FILENAME = "recorded_audio.wav"
 FEEDBACK_FORM_URL = "https://docs.google.com/forms/d/your-form-id-here/viewform?usp=sharing"
 
 # ---------------------- AI ASSISTANT ----------------------
@@ -122,10 +123,10 @@ class StressAssistant:
     def _setup(self):
         """Initialize Groq client (API key from env or hardcoded)."""
         try:
-            from groq import Groq  # or Client in older versions
+            from groq import Groq  # or Client, depending on your installed version
             api_key = os.environ.get("GROQ_API_KEY", "").strip()
             if not api_key:
-                # Fallback: you can paste your key here if you want
+                # fallback (you can hardcode the same key you use locally here)
                 api_key = "YOUR_GROQ_API_KEY"
 
             if not api_key or api_key == "YOUR_GROQ_API_KEY":
@@ -173,22 +174,20 @@ Return JSON only: {"label": "...", "score": ...}
             return None
 
         try:
+            # ✅ use file handle with a real .wav filename
             with open(path, "rb") as f:
-                audio_bytes = f.read()
+                resp = self.client.audio.transcriptions.create(
+                    model="whisper-large-v3-turbo",
+                    file=f,
+                    # response_format="text",  # you can uncomment if your SDK supports it
+                    temperature=0.0,
+                )
 
-            # Using response_format="text" so we get a plain string
-            resp = self.client.audio.transcriptions.create(
-                model="whisper-large-v3-turbo",
-                file=("audio_input", audio_bytes),
-                response_format="text",
-                temperature=0.0,
-            )
-
-            # For response_format="text", resp is usually a string
+            # If response_format="text" is used, resp may be a plain string
             if isinstance(resp, str):
                 return resp.strip()
 
-            # Fallback if library returns an object
+            # Most SDKs return an object with .text
             text = getattr(resp, "text", None)
             if text:
                 return text.strip()
@@ -280,8 +279,8 @@ def main():
         audio_file = st.audio_input("Click to record")
 
         if audio_file:
-            # Save raw uploaded audio as-is; Whisper can handle different formats.
             try:
+                # Save raw uploaded audio with a .wav extension
                 raw = audio_file.read()
                 with open(WAVE_OUTPUT_FILENAME, "wb") as f:
                     f.write(raw)
