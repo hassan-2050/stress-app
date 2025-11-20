@@ -236,7 +236,7 @@ def show_login():
             st.session_state.logged_in = True
             st.session_state.username = username
             st.success(f"Welcome, **{username}**! Redirecting to the app...")
-            st.experimental_rerun()
+            st.rerun()   # 🔁 updated from st.experimental_rerun()
         else:
             st.error("Invalid username or password.")
 
@@ -271,7 +271,7 @@ def main():
             for key in ["logged_in", "username", "done", "text", "sentiment", "score", "rec"]:
                 if key in st.session_state:
                     del st.session_state[key]
-            st.experimental_rerun()
+            st.rerun()   # 🔁 updated from st.experimental_rerun()
 
         st.markdown("---")
         st.header("📋 How to Use")
