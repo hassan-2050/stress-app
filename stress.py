@@ -1,5 +1,4 @@
 import streamlit as st
-import io
 import os
 import json
 from gtts import gTTS
@@ -103,14 +102,10 @@ st.markdown("""
         color: white;
         box-shadow: 0 8px 25px rgba(76, 175, 80, 0.3);
     }
-    .main-content {
-        min-height: 500px;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 # ---------------------- CONSTANTS ----------------------
-# ✅ give it a valid audio extension so Groq can detect type
 WAVE_OUTPUT_FILENAME = "recorded_audio.wav"
 FEEDBACK_FORM_URL = "https://docs.google.com/forms/d/your-form-id-here/viewform?usp=sharing"
 
@@ -126,7 +121,7 @@ class StressAssistant:
             from groq import Groq  # or Client, depending on your installed version
             api_key = os.environ.get("GROQ_API_KEY", "").strip()
             if not api_key:
-                # fallback (you can hardcode the same key you use locally here)
+                # fallback: paste same key you use locally, if you want
                 api_key = "YOUR_GROQ_API_KEY"
 
             if not api_key or api_key == "YOUR_GROQ_API_KEY":
@@ -174,20 +169,16 @@ Return JSON only: {"label": "...", "score": ...}
             return None
 
         try:
-            # ✅ use file handle with a real .wav filename
             with open(path, "rb") as f:
                 resp = self.client.audio.transcriptions.create(
                     model="whisper-large-v3-turbo",
-                    file=f,
-                    # response_format="text",  # you can uncomment if your SDK supports it
+                    file=f,          # filename has .wav extension
                     temperature=0.0,
                 )
 
-            # If response_format="text" is used, resp may be a plain string
             if isinstance(resp, str):
                 return resp.strip()
 
-            # Most SDKs return an object with .text
             text = getattr(resp, "text", None)
             if text:
                 return text.strip()
@@ -280,7 +271,6 @@ def main():
 
         if audio_file:
             try:
-                # Save raw uploaded audio with a .wav extension
                 raw = audio_file.read()
                 with open(WAVE_OUTPUT_FILENAME, "wb") as f:
                     f.write(raw)
@@ -309,8 +299,6 @@ def main():
 
     # ---------------------- TAB 2: RESULTS ----------------------
     with tab2:
-        st.markdown('<div class="main-content">', unsafe_allow_html=True)
-
         if not st.session_state.done:
             st.info("""
 ### 🌟 Welcome to Your Results
@@ -322,6 +310,9 @@ To see your analysis here:
 3. Come back here to view your transcript, emotional tone, and guidance
             """)
         else:
+            # 👇 Pull the main results a bit higher on the page
+            st.markdown('<div style="margin-top:-1.5rem;">', unsafe_allow_html=True)
+
             # What user shared
             st.markdown(f"""
 <div class="info-box">
@@ -422,7 +413,7 @@ This is a simple, high-level emotional snapshot based on your words.
             st.balloons()
             st.success("💚 Thank you for taking a moment for your mental wellness.")
 
-        st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)  # close margin wrapper
 
 
 if __name__ == "__main__":
