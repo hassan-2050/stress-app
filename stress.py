@@ -224,8 +224,8 @@ def show_login():
 
     st.markdown("#### 🔐 Login")
 
-    username = st.text_input("Username", placeholder="admin / trial1 / trial2")
-    password = st.text_input("Password", type="password", placeholder="Test@123")
+    username = st.text_input("Username", placeholder="Enter Username")
+    password = st.text_input("Password", type="password", placeholder="Password")
 
     col1, col2 = st.columns([1, 3])
     with col1:
