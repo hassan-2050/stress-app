@@ -109,6 +109,9 @@ st.markdown("""
 WAVE_OUTPUT_FILENAME = "recorded_audio.wav"
 FEEDBACK_FORM_URL = "https://docs.google.com/forms/d/your-form-id-here/viewform?usp=sharing"
 
+VALID_USERS = {"admin", "trial1", "trial2"}
+VALID_PASSWORD = "Test@123"
+
 # ---------------------- AI ASSISTANT ----------------------
 class StressAssistant:
     def __init__(self):
@@ -214,8 +217,44 @@ Return JSON only: {"label": "...", "score": ...}
             return "Take 3 slow breaths and focus on grounding your body."
 
 
+# ---------------------- LOGIN SCREEN ----------------------
+def show_login():
+    st.markdown('<h1 class="main-header">🧠 Stress Relief Assistant</h1>', unsafe_allow_html=True)
+    st.markdown('<p class="subtitle">Please log in to start your session</p>', unsafe_allow_html=True)
+
+    st.markdown("#### 🔐 Login")
+
+    username = st.text_input("Username", placeholder="admin / trial1 / trial2")
+    password = st.text_input("Password", type="password", placeholder="Test@123")
+
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        login_btn = st.button("Login")
+
+    if login_btn:
+        if username in VALID_USERS and password == VALID_PASSWORD:
+            st.session_state.logged_in = True
+            st.session_state.username = username
+            st.success(f"Welcome, **{username}**! Redirecting to the app...")
+            st.experimental_rerun()
+        else:
+            st.error("Invalid username or password.")
+
+
 # ---------------------- MAIN APP ----------------------
 def main():
+    # --- Session auth state ---
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+    if "username" not in st.session_state:
+        st.session_state.username = None
+
+    # If not logged in, show login and stop
+    if not st.session_state.logged_in:
+        show_login()
+        return
+
+    # From here on: user is logged in
     assistant = StressAssistant()
 
     st.markdown('<h1 class="main-header">🧠 Stress Relief Assistant</h1>', unsafe_allow_html=True)
@@ -226,6 +265,15 @@ def main():
 
     # ---------------------- SIDEBAR INSTRUCTIONS ----------------------
     with st.sidebar:
+        st.markdown(f"**👤 User:** `{st.session_state.username}`")
+        if st.button("Logout"):
+            # Clear only auth + session-related keys
+            for key in ["logged_in", "username", "done", "text", "sentiment", "score", "rec"]:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.experimental_rerun()
+
+        st.markdown("---")
         st.header("📋 How to Use")
         st.markdown("""
 ### 🎙️ Recording Instructions
@@ -256,7 +304,7 @@ def main():
 - Refresh the page to clear everything
         """)
 
-    # ---------------------- SESSION STATE ----------------------
+    # ---------------------- SESSION STATE FOR APP LOGIC ----------------------
     if "done" not in st.session_state:
         st.session_state.done = False
 
@@ -310,7 +358,7 @@ To see your analysis here:
 3. Come back here to view your transcript, emotional tone, and guidance
             """)
         else:
-            # 👇 Pull the main results a bit higher on the page
+            # Pull the main results a bit higher on the page
             st.markdown('<div style="margin-top:-1.5rem;">', unsafe_allow_html=True)
 
             # What user shared
