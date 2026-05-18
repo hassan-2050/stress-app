@@ -93,6 +93,15 @@ st.markdown("""
         margin: 1rem 0;
         box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
     }
+    .sentiment-neutral {
+        background: linear-gradient(135deg, #7f7fd5, #91eae4);
+        padding: 1.5rem;
+        border-radius: 15px;
+        color: white;
+        text-align: center;
+        margin: 1rem 0;
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+    }
     .session-complete {
         background: linear-gradient(135deg, #4CAF50, #45a049);
         padding: 2rem;
@@ -142,9 +151,13 @@ class StressAssistant:
         if not self.client:
             return "NEUTRAL", 0.5
 
-        system_prompt = """
-Return JSON only: {"label": "...", "score": ...}
-"""
+        system_prompt = (
+            "You are a sentiment classifier. Classify the user's message into exactly "
+            "one label: POSITIVE, NEGATIVE, or NEUTRAL, and give a confidence score "
+            "between 0.0 and 1.0. Respond with ONLY a JSON object of the form "
+            '{"label": "POSITIVE"|"NEGATIVE"|"NEUTRAL", "score": <float 0-1>}. '
+            "No prose, no markdown, no code fences."
+        )
 
         try:
             resp = self.client.chat.completions.create(
@@ -154,15 +167,32 @@ Return JSON only: {"label": "...", "score": ...}
                     {"role": "user", "content": text},
                 ],
                 temperature=0.0,
+                response_format={"type": "json_object"},  # forces valid JSON
             )
 
-            out = json.loads(resp.choices[0].message.content)
-            label = out.get("label", "NEUTRAL")
-            score = out.get("score", 0.5)
+            content = resp.choices[0].message.content.strip()
+
+            # Defensive: strip code fences if the model still wraps output
+            if content.startswith("```"):
+                content = content.strip("`").lstrip()
+                if content.lower().startswith("json"):
+                    content = content[4:].lstrip()
+
+            out = json.loads(content)
+
+            label = str(out.get("label", "NEUTRAL")).upper()
+            if label not in {"POSITIVE", "NEGATIVE", "NEUTRAL"}:
+                label = "NEUTRAL"
+
+            try:
+                score = float(out.get("score", 0.5))
+            except (TypeError, ValueError):
+                score = 0.5
+            score = max(0.0, min(1.0, score))  # clamp
+
             return label, score
-        except Exception as e:
-            st.error("Sentiment analysis failed.")
-            st.exception(e)
+        except Exception:
+            # Silent fallback so a parse hiccup doesn't break the UX
             return "NEUTRAL", 0.5
 
     def transcribe(self, path):
@@ -198,8 +228,9 @@ Return JSON only: {"label": "...", "score": ...}
             return "Relax your shoulders and breathe slowly."
 
         prompt = (
-            f"You are a psychologist. User sentiment: {sentiment}. "
-            f"Give a warm 2-sentence recommendation."
+            f"You are a warm, supportive psychologist. The user's sentiment is: {sentiment}. "
+            "Respond in exactly 2 short sentences with a kind, practical suggestion. "
+            "Do not use lists, headings, or markdown."
         )
         try:
             resp = self.client.chat.completions.create(
@@ -209,6 +240,7 @@ Return JSON only: {"label": "...", "score": ...}
                     {"role": "user", "content": text},
                 ],
                 temperature=0.7,
+                max_tokens=120,
             )
             return resp.choices[0].message.content.strip()
         except Exception as e:
@@ -236,7 +268,7 @@ def show_login():
             st.session_state.logged_in = True
             st.session_state.username = username
             st.success(f"Welcome, **{username}**! Redirecting to the app...")
-            st.rerun()   # 🔁 updated from st.experimental_rerun()
+            st.rerun()
         else:
             st.error("Invalid username or password.")
 
@@ -267,11 +299,10 @@ def main():
     with st.sidebar:
         st.markdown(f"**👤 User:** `{st.session_state.username}`")
         if st.button("Logout"):
-            # Clear only auth + session-related keys
             for key in ["logged_in", "username", "done", "text", "sentiment", "score", "rec"]:
                 if key in st.session_state:
                     del st.session_state[key]
-            st.rerun()   # 🔁 updated from st.experimental_rerun()
+            st.rerun()
 
         st.markdown("---")
         st.header("📋 How to Use")
@@ -372,9 +403,13 @@ To see your analysis here:
 </div>
 """, unsafe_allow_html=True)
 
-            # Sentiment box
-            box = "sentiment-positive" if st.session_state.sentiment == "POSITIVE" else "sentiment-negative"
-            emoji = "😊" if box == "sentiment-positive" else "😔"
+            # Sentiment box (now handles NEUTRAL too)
+            if st.session_state.sentiment == "POSITIVE":
+                box, emoji = "sentiment-positive", "😊"
+            elif st.session_state.sentiment == "NEGATIVE":
+                box, emoji = "sentiment-negative", "😔"
+            else:
+                box, emoji = "sentiment-neutral", "😐"
 
             st.markdown(f"""
 <div class="{box}">
