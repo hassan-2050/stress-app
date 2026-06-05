@@ -3,4 +3,4 @@ numpy
 soundfile
 gTTS
 Pillow
-groq
+google-genai
