@@ -335,6 +335,10 @@ LOADING_FACTS = [
 WAVE_OUTPUT_FILENAME = "recorded_audio.wav"
 FEEDBACK_FORM_URL = "https://docs.google.com/forms/d/your-form-id-here/viewform?usp=sharing"
 
+# Gemini LLM configuration (hardcoded key; GEMINI_API_KEY env var overrides it at runtime).
+GEMINI_API_KEY = "AQ.Ab8RN6LO7hZJ1MjZnn8O6xaCENrLZedwzXlMd0ZzBe5IkeW0PQ"
+GEMINI_TEXT_MODEL = "gemini-2.5-flash"
+
 VALID_USERS = {"admin", "trial1", "trial2"}
 VALID_PASSWORD = "Test@123"
 
@@ -455,46 +459,64 @@ class StressAssistant:
         self._setup()
 
     def _setup(self):
-        """Initialize Groq client (API key from env or hardcoded)."""
+        """Initialize the Gemini client (hardcoded API key; GEMINI_API_KEY env var overrides)."""
         try:
-            from groq import Groq  # or Client, depending on your installed version
-            api_key = os.environ.get("GROQ_API_KEY", "").strip()
-            if not api_key:
-                # fallback: paste same key you use locally, if you want
-                api_key = "YOUR_GROQ_API_KEY"
+            from google import genai
+            api_key = os.environ.get("GEMINI_API_KEY", "").strip() or GEMINI_API_KEY
 
-            if not api_key or api_key == "YOUR_GROQ_API_KEY":
-                st.sidebar.error("GROQ_API_KEY not set. Set env var or update code.")
+            if not api_key or api_key == "YOUR_GEMINI_API_KEY":
+                st.sidebar.error("GEMINI_API_KEY not set. Set env var or update code.")
                 return
 
-            self.client = Groq(api_key=api_key)
+            self.client = genai.Client(api_key=api_key)
+            self.model = GEMINI_TEXT_MODEL
             st.sidebar.success("Assistant connected")
         except Exception as e:
             self.client = None
-            st.sidebar.error("Assistant offline (Groq init failed).")
+            st.sidebar.error("Assistant offline (Gemini init failed).")
             st.sidebar.write(e)
 
+    def _json_call(self, system, user, temperature, max_tokens):
+        """Run a JSON-only Gemini completion and return the parsed object."""
+        from google.genai import types
+        resp = self.client.models.generate_content(
+            model=self.model,
+            contents=user,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+                response_mime_type="application/json",
+                # Disable "thinking" so the token budget goes to the JSON, not reasoning.
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        return json.loads(resp.text)
+
     def transcribe(self, path):
-        """Send audio file to Groq Whisper and return text."""
+        """Transcribe a recorded audio file to text using Gemini."""
         if not self.client:
             st.warning("Voice transcription needs the assistant to be connected. "
                        "You can type your reflection instead.")
             return None
 
         try:
+            from google.genai import types
             with open(path, "rb") as f:
-                resp = self.client.audio.transcriptions.create(
-                    model="whisper-large-v3-turbo",
-                    file=f,          # filename has .wav extension
-                    temperature=0.0,
-                )
-
-            if isinstance(resp, str):
-                return resp.strip()
-
-            text = getattr(resp, "text", None)
+                audio_bytes = f.read()
+            resp = self.client.models.generate_content(
+                model=self.model,
+                contents=[
+                    "Transcribe this audio to plain text. Return only the transcript, no commentary.",
+                    types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
+                ],
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                ),
+            )
+            text = (resp.text or "").strip()
             if text:
-                return text.strip()
+                return text
 
             st.error("Transcription response had no text.")
             return None
@@ -503,116 +525,101 @@ class StressAssistant:
             st.exception(e)
             return None
 
-    def assess(self, text, intake, score, band):
-        """Use the LLM to reflect on the person's words and give practical guidance.
+    def followup_questions(self, text):
+        """Suggest 1-2 short follow-up questions based on what the person just shared.
 
-        Falls back to a sensible templated response when the assistant is offline so the
-        app stays useful without an API key.
+        Falls back to sensible defaults when the assistant is offline or nothing was shared.
+        """
+        fallback = [
+            "What is weighing on you the most right now?",
+            "Has anything helped you feel even a little steadier lately?",
+        ]
+        if not self.client or not (text or "").strip():
+            return fallback
+
+        system = (
+            "You are a warm, evidence-based stress-management coach. Based on what the person shared "
+            "in their own words, propose 1 to 2 short, gentle follow-up questions that would help you "
+            "understand their stress better. Make each question specific to what they said, and easy to "
+            "answer out loud. Respond ONLY as a JSON object of the form {\"questions\": [\"...\", \"...\"]}. "
+            "No markdown, no preamble, no medical questions."
+        )
+        user = f"IN THEIR OWN WORDS: {text}"
+        try:
+            out = self._json_call(system, user, temperature=0.5, max_tokens=256)
+            questions = [str(q).strip() for q in out.get("questions", []) if str(q).strip()]
+            return questions[:2] or fallback
+        except Exception:
+            return fallback
+
+    def analyze_text(self, text):
+        """Estimate a stress snapshot from the person's own words (no questionnaire).
+
+        Returns a score (0-100), the factors behind it, relevant stress facts, a short
+        observation, and a practical recommendation. Falls back to a neutral, supportive
+        default when the assistant is offline so the app still works without an API key.
         """
         fallback = {
+            "score": 50,
+            "factors": [
+                ("Based on what you shared",
+                 "The assistant is offline, so this is a general reflection rather than a tailored score."),
+            ],
+            "facts": [
+                "Naming what you feel ('this is stress') already begins to lower its intensity.",
+                "Slow breathing with longer out-breaths than in-breaths signals safety to your nervous system.",
+                "Stress is a normal, adaptive response; the goal is to keep it from staying switched on too long.",
+            ],
             "observations": "",
             "recommendation": (
                 "Take three slow breaths and relax your shoulders, then choose one small thing "
                 "you can do in the next hour. Steady, small steps matter more than fixing everything today."
             ),
         }
-        if not self.client:
+        if not self.client or not (text or "").strip():
             return fallback
 
-        symptoms = ", ".join(intake["symptoms"]) if intake["symptoms"] else "none"
-        summary = (
-            f"Self-reported stress: {intake['stress_now']}/10. "
-            f"Sleep last night: {intake['sleep_hours']:g} hours. "
-            f"Main stressor: {intake['stressor']}. "
-            f"Sense of control this week: {intake['control']}. "
-            f"Energy today: {intake['energy']}. "
-            f"Active days this week: {intake['exercise_days']}. "
-            f"Physical signs: {symptoms}. "
-            f"Computed stress index: {score}/100 ({band})."
-        )
         system = (
             "You are a warm, evidence-based stress-management coach. You are NOT a doctor and never "
-            "diagnose. Given an intake summary and what the person said in their own words, respond ONLY "
-            "as a JSON object of the form "
-            '{"observations": "<at most 2 supportive, specific sentences reflecting what stands out>", '
-            '"recommendation": "<exactly 2 short, practical, doable sentences>"}. '
-            "No markdown, no lists, no medical claims."
+            "diagnose. Read what the person shared in their own words and respond ONLY as a JSON object "
+            "of the form {"
+            '"score": <integer 0-100 estimating their current stress level>, '
+            '"factors": [{"label": "<short label>", "detail": "<one supportive sentence>"}], '
+            '"facts": ["<evidence-based stress fact relevant to what they said>"], '
+            '"observations": "<at most 2 supportive, specific sentences reflecting what stands out>", '
+            '"recommendation": "<exactly 2 short, practical, doable sentences>"'
+            "}. Provide 2 to 4 factors and 2 to 4 facts. No markdown, no medical claims."
         )
-        user = (
-            f"INTAKE SUMMARY: {summary}\n\n"
-            f"IN THEIR OWN WORDS: {text or '(they did not add a spoken or written reflection)'}"
-        )
+        user = f"IN THEIR OWN WORDS: {text}"
         try:
-            resp = self.client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.6,
-                max_tokens=220,
-                response_format={"type": "json_object"},
-            )
-            out = json.loads(resp.choices[0].message.content)
+            out = self._json_call(system, user, temperature=0.5, max_tokens=800)
+            score = int(max(0, min(100, round(float(out.get("score", 50))))))
+            factors = [
+                (str(f.get("label", "")).strip(), str(f.get("detail", "")).strip())
+                for f in out.get("factors", [])
+                if isinstance(f, dict) and str(f.get("label", "")).strip()
+            ][:4] or fallback["factors"]
+            facts = [str(x).strip() for x in out.get("facts", []) if str(x).strip()][:4] or fallback["facts"]
             return {
+                "score": score,
+                "factors": factors,
+                "facts": facts,
                 "observations": str(out.get("observations", "")).strip(),
                 "recommendation": str(out.get("recommendation", "")).strip() or fallback["recommendation"],
             }
         except Exception:
             return fallback
 
-    def followup_questions(self, text, intake):
-        """Suggest 1-2 short follow-up questions so the person can share a bit more.
 
-        These are tailored to the intake answers and to what the person already said,
-        so the second round of input deepens the picture instead of repeating it.
-        Falls back to sensible defaults when the assistant is offline.
-        """
-        fallback = [
-            "What is weighing on you the most right now?",
-            "Has anything helped you feel even a little steadier lately?",
-        ]
-        if not self.client:
-            return fallback
-
-        symptoms = ", ".join(intake["symptoms"]) if intake["symptoms"] else "none"
-        summary = (
-            f"Self-reported stress: {intake['stress_now']}/10. "
-            f"Sleep last night: {intake['sleep_hours']:g} hours. "
-            f"Main stressor: {intake['stressor']}. "
-            f"Sense of control this week: {intake['control']}. "
-            f"Energy today: {intake['energy']}. "
-            f"Active days this week: {intake['exercise_days']}. "
-            f"Physical signs: {symptoms}."
-        )
-        system = (
-            "You are a warm, evidence-based stress-management coach. Based on an intake summary "
-            "and what the person shared in their own words, propose 1 to 2 short, gentle follow-up "
-            "questions that would help you understand their stress better. Make each question "
-            "specific to what they said when possible, and easy to answer out loud. Respond ONLY "
-            "as a JSON object of the form {\"questions\": [\"...\", \"...\"]}. "
-            "No markdown, no preamble, no medical questions."
-        )
-        user = (
-            f"INTAKE SUMMARY: {summary}\n\n"
-            f"IN THEIR OWN WORDS: {text or '(they have not added a spoken or written reflection yet)'}"
-        )
-        try:
-            resp = self.client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.5,
-                max_tokens=160,
-                response_format={"type": "json_object"},
-            )
-            out = json.loads(resp.choices[0].message.content)
-            questions = [str(q).strip() for q in out.get("questions", []) if str(q).strip()]
-            return questions[:2] or fallback
-        except Exception:
-            return fallback
+def band_for_score(score):
+    """Map a 0-100 stress score onto the four bands used across the UI."""
+    if score <= 25:
+        return "LOW"
+    elif score <= 50:
+        return "MODERATE"
+    elif score <= 75:
+        return "HIGH"
+    return "SEVERE"
 
 
 def _capture_text(typed, audio_file, assistant, filename):
@@ -804,17 +811,17 @@ def main():
         st.markdown("---")
         st.header("How to Use")
         st.markdown("""
-**Step 1 — Check-In Questions**
-Answer the short set of questions about your sleep, energy, and how you have been feeling. They take about a minute.
+**Step 1 — Share What Is on Your Mind**
+Record or type a few sentences about how you have been feeling and what is going on.
 
-**Step 2 — Share How You Feel**
-Speak or type a few sentences about what is on your mind. This part is optional but makes your guidance more personal.
+**Step 2 — Answer a Follow-Up or Two**
+Based on what you shared, the assistant asks a couple of short questions. Record or type a little more.
 
 **Step 3 — Analyze**
 Select **Analyze My Stress**, then open the **Results** tab for your stress snapshot, the factors behind it, stress facts, and practical guidance.
 
 **Tips**
-- Answer honestly; there are no right answers
+- Speak naturally; there are no right answers
 - 5-30 seconds of audio is plenty
 - Use a quiet space if you record
         """)
@@ -837,62 +844,30 @@ Select **Analyze My Stress**, then open the **Results** tab for your stress snap
 
     # ---------------------- TAB 1: CHECK-IN ----------------------
     with tab1:
-        st.markdown('<div class="section-title">A Few Questions First</div>', unsafe_allow_html=True)
-        st.markdown("These quick check-in questions ground the analysis in your real day. Nothing is stored.")
-
-        c1, c2 = st.columns(2)
-        with c1:
-            stress_now = st.slider("How stressed do you feel right now?", 0, 10, 5,
-                                   help="0 = completely calm, 10 = extremely stressed",
-                                   key="q_stress_now")
-            sleep_hours = st.slider("How many hours did you sleep last night?", 0.0, 12.0, 7.0, 0.5,
-                                    key="q_sleep_hours")
-            exercise_days = st.slider("How many days were you physically active this week?", 0, 7, 2,
-                                      key="q_exercise_days")
-        with c2:
-            stressor = st.selectbox("What is the main source of your stress today?", STRESSOR_OPTIONS,
-                                    key="q_stressor")
-            control = st.selectbox(
-                "In the past week, how often have you felt unable to control the important things in your life?",
-                CONTROL_OPTIONS, index=2, key="q_control")
-            energy = st.radio("How is your energy level today?",
-                              ["Low", "Moderate", "High"], index=1, horizontal=True, key="q_energy")
-
-        symptoms = st.multiselect("Any physical signs lately? (select all that apply)",
-                                  SYMPTOM_OPTIONS, default=[], key="q_symptoms")
-
-        # Build the intake snapshot from the current widget values.
-        intake = {
-            "stress_now": stress_now,
-            "sleep_hours": sleep_hours,
-            "exercise_days": exercise_days,
-            "stressor": stressor,
-            "control": control,
-            "energy": energy,
-            "symptoms": symptoms or ["None"],
-        }
-
-        st.markdown('<div class="section-title">Share How You Feel</div>', unsafe_allow_html=True)
-        st.markdown("Speak or type a little about what is on your mind. This is optional, but it makes your guidance more personal.")
-
-        audio_file = st.audio_input("Record (optional)", key="initial_audio")
-        typed = st.text_area(
-            "Or type it here (optional)",
-            placeholder="For example: Work has been overwhelming and I have not been sleeping well...",
-            height=110,
-            key="initial_typed",
-        )
+        st.markdown('<div class="section-title">Share What Is on Your Mind</div>', unsafe_allow_html=True)
+        st.markdown("Speak or type a little about how you have been feeling and what is going on. "
+                    "A few sentences is plenty. Nothing is stored.")
 
         # ---- Stage 1: capture the first reflection, then ask 1-2 follow-ups ----
         if st.session_state.stage == "intake":
+            audio_file = st.audio_input("Record your thoughts", key="initial_audio")
+            typed = st.text_area(
+                "Or type them here",
+                placeholder="For example: Work has been overwhelming and I have not been sleeping well...",
+                height=140,
+                key="initial_typed",
+            )
+
             if st.button("Continue", use_container_width=True):
-                st.session_state.intake = intake
                 text = _capture_text(typed, audio_file, assistant, WAVE_OUTPUT_FILENAME)
-                st.session_state.text = text
-                with st.spinner("Reading your check-in..."):
-                    st.session_state.followups = assistant.followup_questions(text, intake)
-                st.session_state.stage = "followup"
-                st.rerun()
+                if not text:
+                    st.warning("Please record or type a few words first so we have something to reflect on.")
+                else:
+                    st.session_state.text = text
+                    with st.spinner("Reading what you shared..."):
+                        st.session_state.followups = assistant.followup_questions(text)
+                    st.session_state.stage = "followup"
+                    st.rerun()
 
         # ---- Stage 2: a couple of tailored follow-ups for a clearer picture ----
         elif st.session_state.stage == "followup":
@@ -906,7 +881,7 @@ Select **Analyze My Stress**, then open the **Results** tab for your stress snap
 
             st.markdown('<div class="section-title">A Couple More Things</div>', unsafe_allow_html=True)
             st.markdown("Based on what you shared, these help round out the picture. "
-                        "Speak or type your answers — both are optional, and a few sentences is plenty.")
+                        "Speak or type your answers — a few sentences each is plenty.")
 
             for i, q in enumerate(st.session_state.get("followups", [])):
                 st.markdown(f'<div class="fact-item"><strong>{q}</strong></div>', unsafe_allow_html=True)
@@ -941,25 +916,23 @@ Select **Analyze My Stress**, then open the **Results** tab for your stress snap
                 loading_box = st.empty()
                 picks = random.sample(LOADING_FACTS, 3)
                 loading_box.markdown(
-                    '<div class="section-title">While we analyze your check-in</div>'
+                    '<div class="section-title">While we look over what you shared</div>'
                     + "".join(f'<div class="fact-item">{p}</div>' for p in picks),
                     unsafe_allow_html=True,
                 )
 
-                with st.spinner("Analyzing your check-in..."):
-                    score, band, factors = compute_stress_index(intake)
-                    facts = select_stress_facts(intake)
-                    ai = assistant.assess(text, intake, score, band)
+                with st.spinner("Analyzing what you shared..."):
+                    result = assistant.analyze_text(text)
 
                 loading_box.empty()
 
-                st.session_state.intake = intake
+                score = result["score"]
                 st.session_state.score = score
-                st.session_state.band = band
-                st.session_state.factors = factors
-                st.session_state.facts = facts
-                st.session_state.observations = ai.get("observations", "")
-                st.session_state.rec = ai.get("recommendation", "")
+                st.session_state.band = band_for_score(score)
+                st.session_state.factors = result["factors"]
+                st.session_state.facts = result["facts"]
+                st.session_state.observations = result["observations"]
+                st.session_state.rec = result["recommendation"]
                 st.session_state.done = True
                 st.session_state.stage = "done"
 
@@ -969,7 +942,7 @@ Select **Analyze My Stress**, then open the **Results** tab for your stress snap
         else:
             st.success("Your analysis is ready in the Results tab.")
             if st.button("Start a New Check-In", use_container_width=True):
-                for k in ["done", "stage", "followups", "text", "intake", "score",
+                for k in ["done", "stage", "followups", "text", "score",
                           "band", "factors", "facts", "observations", "rec"]:
                     st.session_state.pop(k, None)
                 st.rerun()
@@ -983,7 +956,7 @@ Select **Analyze My Stress**, then open the **Results** tab for your stress snap
 To see your analysis here:
 
 1. Open the **Check-In** tab
-2. Answer the questions and, if you like, share how you feel
+2. Share how you feel, then answer a quick follow-up
 3. Select **Analyze My Stress**, then return here
             """)
         else:
