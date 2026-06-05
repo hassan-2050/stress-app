@@ -497,7 +497,7 @@ class StressAssistant:
         """Transcribe a recorded audio file to text using Gemini."""
         if not self.client:
             st.warning("Voice transcription needs the assistant to be connected. "
-                       "You can type your reflection instead.")
+                       "Please try again once it is back online.")
             return None
 
         try:
@@ -635,6 +635,15 @@ def _capture_text(typed, audio_file, assistant, filename):
             st.error("Audio processing failed.")
             st.exception(e)
     return text
+
+
+def synth_speech(text, path):
+    """Render text to an MP3 with gTTS so it can be played aloud; return path or None."""
+    try:
+        gTTS(text).save(path)
+        return path
+    except Exception:
+        return None
 
 
 # ---------------------- LOGIN SCREEN ----------------------
@@ -802,8 +811,8 @@ def main():
     with st.sidebar:
         st.markdown(f"**Signed in as** `{st.session_state.username}`")
         if st.button("Log out", use_container_width=True):
-            for key in ["logged_in", "username", "done", "stage", "followups", "text",
-                        "intake", "score", "band", "factors", "facts", "observations", "rec"]:
+            for key in ["logged_in", "username", "done", "stage", "followups", "followup_audio",
+                        "text", "intake", "score", "band", "factors", "facts", "observations", "rec"]:
                 if key in st.session_state:
                     del st.session_state[key]
             st.rerun()
@@ -812,10 +821,10 @@ def main():
         st.header("How to Use")
         st.markdown("""
 **Step 1 — Share What Is on Your Mind**
-Record or type a few sentences about how you have been feeling and what is going on.
+Record a few sentences about how you have been feeling and what is going on.
 
 **Step 2 — Answer a Follow-Up or Two**
-Based on what you shared, the assistant asks a couple of short questions. Record or type a little more.
+The assistant asks a couple of short questions and reads them aloud. Listen, then record your answer.
 
 **Step 3 — Analyze**
 Select **Analyze My Stress**, then open the **Results** tab for your stress snapshot, the factors behind it, stress facts, and practical guidance.
@@ -845,27 +854,26 @@ Select **Analyze My Stress**, then open the **Results** tab for your stress snap
     # ---------------------- TAB 1: CHECK-IN ----------------------
     with tab1:
         st.markdown('<div class="section-title">Share What Is on Your Mind</div>', unsafe_allow_html=True)
-        st.markdown("Speak or type a little about how you have been feeling and what is going on. "
+        st.markdown("Speak a little about how you have been feeling and what is going on. "
                     "A few sentences is plenty. Nothing is stored.")
 
         # ---- Stage 1: capture the first reflection, then ask 1-2 follow-ups ----
         if st.session_state.stage == "intake":
             audio_file = st.audio_input("Record your thoughts", key="initial_audio")
-            typed = st.text_area(
-                "Or type them here",
-                placeholder="For example: Work has been overwhelming and I have not been sleeping well...",
-                height=140,
-                key="initial_typed",
-            )
 
             if st.button("Continue", use_container_width=True):
-                text = _capture_text(typed, audio_file, assistant, WAVE_OUTPUT_FILENAME)
+                text = _capture_text("", audio_file, assistant, WAVE_OUTPUT_FILENAME)
                 if not text:
-                    st.warning("Please record or type a few words first so we have something to reflect on.")
+                    st.warning("Please record a few words first so we have something to reflect on.")
                 else:
                     st.session_state.text = text
-                    with st.spinner("Reading what you shared..."):
-                        st.session_state.followups = assistant.followup_questions(text)
+                    with st.spinner("Listening to what you shared and preparing your questions..."):
+                        followups = assistant.followup_questions(text)
+                        st.session_state.followups = followups
+                        # Pre-render each question to speech so it can be played aloud.
+                        st.session_state.followup_audio = [
+                            synth_speech(q, f"question_{i}.mp3") for i, q in enumerate(followups)
+                        ]
                     st.session_state.stage = "followup"
                     st.rerun()
 
@@ -881,12 +889,14 @@ Select **Analyze My Stress**, then open the **Results** tab for your stress snap
 
             st.markdown('<div class="section-title">A Couple More Things</div>', unsafe_allow_html=True)
             st.markdown("Based on what you shared, these help round out the picture. "
-                        "Speak or type your answers — a few sentences each is plenty.")
+                        "Tap play to hear each question, then record your answer.")
 
+            followup_audio = st.session_state.get("followup_audio", [])
             for i, q in enumerate(st.session_state.get("followups", [])):
                 st.markdown(f'<div class="fact-item"><strong>{q}</strong></div>', unsafe_allow_html=True)
+                if i < len(followup_audio) and followup_audio[i]:
+                    st.audio(followup_audio[i])  # the question, read aloud
                 st.audio_input("Record your answer", key=f"fu_audio_{i}")
-                st.text_area("Or type your answer", height=90, key=f"fu_typed_{i}")
 
             col_back, col_go = st.columns([1, 1])
             with col_back:
@@ -904,9 +914,8 @@ Select **Analyze My Stress**, then open the **Results** tab for your stress snap
                 if st.session_state.get("text"):
                     parts.append(st.session_state.text)
                 for i, q in enumerate(st.session_state.get("followups", [])):
-                    a_typed = st.session_state.get(f"fu_typed_{i}", "")
                     a_audio = st.session_state.get(f"fu_audio_{i}")
-                    answer = _capture_text(a_typed, a_audio, assistant, f"followup_{i}.wav")
+                    answer = _capture_text("", a_audio, assistant, f"followup_{i}.wav")
                     if answer:
                         parts.append(f"{q} {answer}")
                 text = "\n".join(parts).strip()
@@ -942,7 +951,7 @@ Select **Analyze My Stress**, then open the **Results** tab for your stress snap
         else:
             st.success("Your analysis is ready in the Results tab.")
             if st.button("Start a New Check-In", use_container_width=True):
-                for k in ["done", "stage", "followups", "text", "score",
+                for k in ["done", "stage", "followups", "followup_audio", "text", "score",
                           "band", "factors", "facts", "observations", "rec"]:
                     st.session_state.pop(k, None)
                 st.rerun()
