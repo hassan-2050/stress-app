@@ -561,6 +561,74 @@ class StressAssistant:
         except Exception:
             return fallback
 
+    def followup_questions(self, text, intake):
+        """Suggest 1-2 short follow-up questions so the person can share a bit more.
+
+        These are tailored to the intake answers and to what the person already said,
+        so the second round of input deepens the picture instead of repeating it.
+        Falls back to sensible defaults when the assistant is offline.
+        """
+        fallback = [
+            "What is weighing on you the most right now?",
+            "Has anything helped you feel even a little steadier lately?",
+        ]
+        if not self.client:
+            return fallback
+
+        symptoms = ", ".join(intake["symptoms"]) if intake["symptoms"] else "none"
+        summary = (
+            f"Self-reported stress: {intake['stress_now']}/10. "
+            f"Sleep last night: {intake['sleep_hours']:g} hours. "
+            f"Main stressor: {intake['stressor']}. "
+            f"Sense of control this week: {intake['control']}. "
+            f"Energy today: {intake['energy']}. "
+            f"Active days this week: {intake['exercise_days']}. "
+            f"Physical signs: {symptoms}."
+        )
+        system = (
+            "You are a warm, evidence-based stress-management coach. Based on an intake summary "
+            "and what the person shared in their own words, propose 1 to 2 short, gentle follow-up "
+            "questions that would help you understand their stress better. Make each question "
+            "specific to what they said when possible, and easy to answer out loud. Respond ONLY "
+            "as a JSON object of the form {\"questions\": [\"...\", \"...\"]}. "
+            "No markdown, no preamble, no medical questions."
+        )
+        user = (
+            f"INTAKE SUMMARY: {summary}\n\n"
+            f"IN THEIR OWN WORDS: {text or '(they have not added a spoken or written reflection yet)'}"
+        )
+        try:
+            resp = self.client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.5,
+                max_tokens=160,
+                response_format={"type": "json_object"},
+            )
+            out = json.loads(resp.choices[0].message.content)
+            questions = [str(q).strip() for q in out.get("questions", []) if str(q).strip()]
+            return questions[:2] or fallback
+        except Exception:
+            return fallback
+
+
+def _capture_text(typed, audio_file, assistant, filename):
+    """Return the person's words, preferring typed text and falling back to transcription."""
+    text = (typed or "").strip()
+    if not text and audio_file is not None:
+        try:
+            raw = audio_file.read()
+            with open(filename, "wb") as f:
+                f.write(raw)
+            text = assistant.transcribe(filename) or ""
+        except Exception as e:
+            st.error("Audio processing failed.")
+            st.exception(e)
+    return text
+
 
 # ---------------------- LOGIN SCREEN ----------------------
 def show_login():
@@ -727,8 +795,8 @@ def main():
     with st.sidebar:
         st.markdown(f"**Signed in as** `{st.session_state.username}`")
         if st.button("Log out", use_container_width=True):
-            for key in ["logged_in", "username", "done", "text", "intake", "score",
-                        "band", "factors", "facts", "observations", "rec"]:
+            for key in ["logged_in", "username", "done", "stage", "followups", "text",
+                        "intake", "score", "band", "factors", "facts", "observations", "rec"]:
                 if key in st.session_state:
                     del st.session_state[key]
             st.rerun()
@@ -761,6 +829,9 @@ Select **Analyze My Stress**, then open the **Results** tab for your stress snap
     # ---------------------- APP STATE ----------------------
     if "done" not in st.session_state:
         st.session_state.done = False
+    # Check-In moves through stages: intake -> followup -> done
+    if "stage" not in st.session_state:
+        st.session_state.stage = "intake"
 
     tab1, tab2 = st.tabs(["Check-In", "Results"])
 
@@ -772,82 +843,136 @@ Select **Analyze My Stress**, then open the **Results** tab for your stress snap
         c1, c2 = st.columns(2)
         with c1:
             stress_now = st.slider("How stressed do you feel right now?", 0, 10, 5,
-                                   help="0 = completely calm, 10 = extremely stressed")
-            sleep_hours = st.slider("How many hours did you sleep last night?", 0.0, 12.0, 7.0, 0.5)
-            exercise_days = st.slider("How many days were you physically active this week?", 0, 7, 2)
+                                   help="0 = completely calm, 10 = extremely stressed",
+                                   key="q_stress_now")
+            sleep_hours = st.slider("How many hours did you sleep last night?", 0.0, 12.0, 7.0, 0.5,
+                                    key="q_sleep_hours")
+            exercise_days = st.slider("How many days were you physically active this week?", 0, 7, 2,
+                                      key="q_exercise_days")
         with c2:
-            stressor = st.selectbox("What is the main source of your stress today?", STRESSOR_OPTIONS)
+            stressor = st.selectbox("What is the main source of your stress today?", STRESSOR_OPTIONS,
+                                    key="q_stressor")
             control = st.selectbox(
                 "In the past week, how often have you felt unable to control the important things in your life?",
-                CONTROL_OPTIONS, index=2)
+                CONTROL_OPTIONS, index=2, key="q_control")
             energy = st.radio("How is your energy level today?",
-                              ["Low", "Moderate", "High"], index=1, horizontal=True)
+                              ["Low", "Moderate", "High"], index=1, horizontal=True, key="q_energy")
 
         symptoms = st.multiselect("Any physical signs lately? (select all that apply)",
-                                  SYMPTOM_OPTIONS, default=[])
+                                  SYMPTOM_OPTIONS, default=[], key="q_symptoms")
+
+        # Build the intake snapshot from the current widget values.
+        intake = {
+            "stress_now": stress_now,
+            "sleep_hours": sleep_hours,
+            "exercise_days": exercise_days,
+            "stressor": stressor,
+            "control": control,
+            "energy": energy,
+            "symptoms": symptoms or ["None"],
+        }
 
         st.markdown('<div class="section-title">Share How You Feel</div>', unsafe_allow_html=True)
         st.markdown("Speak or type a little about what is on your mind. This is optional, but it makes your guidance more personal.")
 
-        audio_file = st.audio_input("Record (optional)")
+        audio_file = st.audio_input("Record (optional)", key="initial_audio")
         typed = st.text_area(
             "Or type it here (optional)",
             placeholder="For example: Work has been overwhelming and I have not been sleeping well...",
             height=110,
+            key="initial_typed",
         )
 
-        analyze = st.button("Analyze My Stress", use_container_width=True)
+        # ---- Stage 1: capture the first reflection, then ask 1-2 follow-ups ----
+        if st.session_state.stage == "intake":
+            if st.button("Continue", use_container_width=True):
+                st.session_state.intake = intake
+                text = _capture_text(typed, audio_file, assistant, WAVE_OUTPUT_FILENAME)
+                st.session_state.text = text
+                with st.spinner("Reading your check-in..."):
+                    st.session_state.followups = assistant.followup_questions(text, intake)
+                st.session_state.stage = "followup"
+                st.rerun()
 
-        if analyze:
-            intake = {
-                "stress_now": stress_now,
-                "sleep_hours": sleep_hours,
-                "exercise_days": exercise_days,
-                "stressor": stressor,
-                "control": control,
-                "energy": energy,
-                "symptoms": symptoms or ["None"],
-            }
+        # ---- Stage 2: a couple of tailored follow-ups for a clearer picture ----
+        elif st.session_state.stage == "followup":
+            if st.session_state.get("text"):
+                st.markdown('<div class="section-title">What You Shared</div>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<div class="info-box"><p style="font-style:italic; line-height:1.6;">'
+                    f'{st.session_state.text}</p></div>',
+                    unsafe_allow_html=True,
+                )
 
-            # Prefer typed text; otherwise transcribe the recording if one was made.
-            text = (typed or "").strip()
-            if not text and audio_file is not None:
-                try:
-                    raw = audio_file.read()
-                    with open(WAVE_OUTPUT_FILENAME, "wb") as f:
-                        f.write(raw)
-                    text = assistant.transcribe(WAVE_OUTPUT_FILENAME) or ""
-                except Exception as e:
-                    st.error("Audio processing failed.")
-                    st.exception(e)
+            st.markdown('<div class="section-title">A Couple More Things</div>', unsafe_allow_html=True)
+            st.markdown("Based on what you shared, these help round out the picture. "
+                        "Speak or type your answers — both are optional, and a few sentences is plenty.")
 
-            # Keep the person company with a few quick facts while the analysis runs.
-            loading_box = st.empty()
-            picks = random.sample(LOADING_FACTS, 3)
-            loading_box.markdown(
-                '<div class="section-title">While we analyze your check-in</div>'
-                + "".join(f'<div class="fact-item">{p}</div>' for p in picks),
-                unsafe_allow_html=True,
-            )
+            for i, q in enumerate(st.session_state.get("followups", [])):
+                st.markdown(f'<div class="fact-item"><strong>{q}</strong></div>', unsafe_allow_html=True)
+                st.audio_input("Record your answer", key=f"fu_audio_{i}")
+                st.text_area("Or type your answer", height=90, key=f"fu_typed_{i}")
 
-            with st.spinner("Analyzing your check-in..."):
-                score, band, factors = compute_stress_index(intake)
-                facts = select_stress_facts(intake)
-                ai = assistant.assess(text, intake, score, band)
+            col_back, col_go = st.columns([1, 1])
+            with col_back:
+                back = st.button("Back", use_container_width=True)
+            with col_go:
+                analyze = st.button("Analyze My Stress", use_container_width=True)
 
-            loading_box.empty()
+            if back:
+                st.session_state.stage = "intake"
+                st.rerun()
 
-            st.session_state.intake = intake
-            st.session_state.text = text
-            st.session_state.score = score
-            st.session_state.band = band
-            st.session_state.factors = factors
-            st.session_state.facts = facts
-            st.session_state.observations = ai.get("observations", "")
-            st.session_state.rec = ai.get("recommendation", "")
-            st.session_state.done = True
+            if analyze:
+                # Combine the first reflection with the follow-up answers.
+                parts = []
+                if st.session_state.get("text"):
+                    parts.append(st.session_state.text)
+                for i, q in enumerate(st.session_state.get("followups", [])):
+                    a_typed = st.session_state.get(f"fu_typed_{i}", "")
+                    a_audio = st.session_state.get(f"fu_audio_{i}")
+                    answer = _capture_text(a_typed, a_audio, assistant, f"followup_{i}.wav")
+                    if answer:
+                        parts.append(f"{q} {answer}")
+                text = "\n".join(parts).strip()
+                st.session_state.text = text
 
-            st.success("Analysis ready. Open the Results tab to view your stress snapshot.")
+                # Keep the person company with a few quick facts while the analysis runs.
+                loading_box = st.empty()
+                picks = random.sample(LOADING_FACTS, 3)
+                loading_box.markdown(
+                    '<div class="section-title">While we analyze your check-in</div>'
+                    + "".join(f'<div class="fact-item">{p}</div>' for p in picks),
+                    unsafe_allow_html=True,
+                )
+
+                with st.spinner("Analyzing your check-in..."):
+                    score, band, factors = compute_stress_index(intake)
+                    facts = select_stress_facts(intake)
+                    ai = assistant.assess(text, intake, score, band)
+
+                loading_box.empty()
+
+                st.session_state.intake = intake
+                st.session_state.score = score
+                st.session_state.band = band
+                st.session_state.factors = factors
+                st.session_state.facts = facts
+                st.session_state.observations = ai.get("observations", "")
+                st.session_state.rec = ai.get("recommendation", "")
+                st.session_state.done = True
+                st.session_state.stage = "done"
+
+                st.success("Analysis ready. Open the Results tab to view your stress snapshot.")
+
+        # ---- Already analyzed: offer a fresh start ----
+        else:
+            st.success("Your analysis is ready in the Results tab.")
+            if st.button("Start a New Check-In", use_container_width=True):
+                for k in ["done", "stage", "followups", "text", "intake", "score",
+                          "band", "factors", "facts", "observations", "rec"]:
+                    st.session_state.pop(k, None)
+                st.rerun()
 
     # ---------------------- TAB 2: RESULTS ----------------------
     with tab2:
