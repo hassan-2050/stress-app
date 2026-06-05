@@ -335,9 +335,21 @@ LOADING_FACTS = [
 WAVE_OUTPUT_FILENAME = "recorded_audio.wav"
 FEEDBACK_FORM_URL = "https://docs.google.com/forms/d/your-form-id-here/viewform?usp=sharing"
 
-# Gemini LLM configuration (hardcoded key; GEMINI_API_KEY env var overrides it at runtime).
-GEMINI_API_KEY = "AQ.Ab8RN6LO7hZJ1MjZnn8O6xaCENrLZedwzXlMd0ZzBe5IkeW0PQ"
+# Gemini LLM configuration. Prefer Streamlit Secrets / env var so the key stays out of git;
+# the hardcoded value below is only a last-resort fallback for quick local runs.
+GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"
 GEMINI_TEXT_MODEL = "gemini-2.5-flash"
+
+
+def get_api_key():
+    """Resolve the Gemini API key: Streamlit secret first, then env var, then hardcoded fallback."""
+    try:
+        secret = st.secrets.get("GEMINI_API_KEY")
+        if secret:
+            return str(secret).strip()
+    except Exception:
+        pass  # No secrets file configured; fall through to env var / hardcoded value.
+    return os.environ.get("GEMINI_API_KEY", "").strip() or GEMINI_API_KEY
 
 VALID_USERS = {"admin", "trial1", "trial2"}
 VALID_PASSWORD = "Test@123"
@@ -459,13 +471,13 @@ class StressAssistant:
         self._setup()
 
     def _setup(self):
-        """Initialize the Gemini client (hardcoded API key; GEMINI_API_KEY env var overrides)."""
+        """Initialize the Gemini client (Streamlit secret, then env var, then hardcoded fallback)."""
         try:
             from google import genai
-            api_key = os.environ.get("GEMINI_API_KEY", "").strip() or GEMINI_API_KEY
+            api_key = get_api_key()
 
             if not api_key or api_key == "YOUR_GEMINI_API_KEY":
-                st.sidebar.error("GEMINI_API_KEY not set. Set env var or update code.")
+                st.sidebar.error("GEMINI_API_KEY not set. Add it in Streamlit Secrets or set the env var.")
                 return
 
             self.client = genai.Client(api_key=api_key)
